@@ -1,0 +1,548 @@
+#!/bin/bash
+######################################################################## 
+#	The create-instance-volume program is used to manage the  ec2-instance as well as ec2-volume
+#	Code implementation: 
+#	usage | volume-id ?
+######################################################################## 
+#
+# CONSTANTS -- String COMMAND
+#
+
+if [ ! -z $EC2_VOLUME_ID ];
+then
+	EC2_BACKUP_VOLUME_ZONE=$(aws ec2 describe-volumes --volume-ids $EC2_VOLUME_ID --output text --query 'Volumes[0].[AvailabilityZone]')
+	log $V "The Specified Volume: $EC2_VOLUME_ID locates in $EC2_BACKUP_VOLUME_ZONE"
+fi
+
+EC2_BACKUP_DEFAULT_SECURITY_GROUP="ec2_default_backup_security_group"
+EC2_BACKUP_DEFAULT_KEY_PAIR="ec2_default_key_pair"
+
+# #SUPPORT LIST OF INSTANCE
+EC2_BACKUP_INSTANCES_DIC=( 
+ 			"us-east-1:ami-6de0dd04"
+		        "us-west-1:ami-d4d9eb91"
+		        "us-west-2:ami-56771366"
+		        "eu-west-1:ami-000cf877"
+		        "ap-southeast-1:ami-82085ed0"
+		        "ap-southeast-2:ami-6da53b57"
+		        "ap-northeast-1:ami-3def863c"
+		        "sa-east-1:ami-6366c67e")
+		        
+#
+# Variable -- String CONSTANTS
+#
+#Instance Attribute
+var_security_group=''
+var_instance_id=''
+var_instace_host=''
+var_key_pair=''
+var_backup_region=''
+var_instance_username='ubuntu'
+
+var_volume_id=$EC2_VOLUME_ID
+var_default_attachpoint="/dev/sdh"
+var_default_devicename="/dev/xvdh"
+var_default_mountDir="/mnt/ec2-backup"
+var_dd_backup_dir="$var_default_mountDir/dd"
+var_rsync_backup_dir="$var_default_mountDir/rsync"
+#
+# Utils -- Checking Method
+#
+check_security_group() {
+		log $V "Checking the security group [$1]"
+		local group=$1
+		local result=''
+		for var_group in $(aws ec2 describe-security-groups --output text --query 'SecurityGroups[*].[GroupName]')
+		do
+			if [[ $group == $var_group ]];
+			then
+				result=$var_group
+				break
+			fi
+		done
+		
+		if [ -z $result ];
+		then
+			
+			log "The security-group: [$group] does not exist in your current region [$EC2_BACKUP_CURRENT_REGION]: pleas check your EC2_BACKUP_FLAGS_AWS"
+			exit 1
+		fi
+		log $V "ok!"
+}
+
+check_key_pair() {
+		log $V  "Checking the key pair [$1]"
+		local key_pair=$1
+		local result=''
+		for var_key_pair in $(aws ec2 describe-key-pairs --output text --query 'KeyPairs[*].[KeyName]')
+		do
+			if [[ $key_pair == $var_key_pair ]];
+			then
+				result=$var_key_pair
+				break
+			fi
+		done
+				
+		if [ -z $result ];
+		then
+			log "The key pair: [$key_pair] does not exist in your current region [$EC2_BACKUP_CURRENT_REGION]: pleas check your EC2_BACKUP_FLAGS_AWS"
+			exit 1
+		fi	
+		log $V "ok!"
+}
+
+	
+check_error_exit() {
+	if [ $? -ne 0 ];
+	then
+		log "$1"
+		terminate_all_resource
+		exit 1
+	fi	
+}
+
+# check status of instance
+#  0 : pending
+# 16 : running
+# 32 : shutting-down
+# 48 : terminated
+# 64 : stopping
+# 80 : stopped
+
+check_create_instance() {
+	if [ ! -z $var_instance_id ];
+	then
+		local instance_status=$(aws ec2 describe-instances --instance-ids $var_instance_id --output text --filters "Name=instance-id, Values=$var_instance_id" --query 'Reservations[0].[Instances[0].State.Code]')
+		if [ $instance_status -eq 16 ];
+		then
+			return 0
+		else
+			return 1
+		fi	
+	else
+		log "Invalid instance id [$var_instance_id]"
+		exit 1
+	fi
+}
+
+check_terminate_instance() {
+	if [ ! -z $var_instance_id ];
+	then
+		local instance_status=$(aws ec2 describe-instances --instance-ids $var_instance_id --output text --filters "Name=instance-id, Values=$var_instance_id" --query 'Reservations[0].[Instances[0].State.Code]')
+			if [ $instance_status -eq 32 ] || [ $instance_status -eq 48 ];
+			then
+				return 0
+			else
+				return 1
+			fi	
+	else
+		log "Invalid instance id [$var_instance_id]"
+		exit 1
+	fi
+}
+
+check_attach_volume() {
+	if [ ! -z $var_volume_id ];
+	then
+		local volume_status=$(aws ec2 describe-volumes --volume-id $var_volume_id --output text | awk '{print$6}')
+		if [[ $volume_status != *attached* ]];
+		then
+			return 1
+		else
+			return 0
+		fi
+	fi
+}
+
+check_detach_volume() {
+	if [ ! -z $var_volume_id ];
+	then
+		local volume_status=$(aws ec2 describe-volumes --volume-id $var_volume_id --output text | awk '{print$6}')
+		if [[ $volume_status == *available* ]];
+		then
+			return 0
+		else
+			return 1
+		fi
+	fi
+}
+
+check_volume_exist() {
+	if [ ! -z $var_volume_id ];
+	then
+		local volume_status=$(aws ec2 describe-volumes --volume-id $var_volume_id --output text | awk '{print$6}')
+		if [[  $volume_status == *available* ]];
+		then
+			return 0
+		else
+			return 1
+		fi
+	fi		
+}
+
+# if VOLUME_ID is set, then used the region of volume
+# else use the current account region
+if [ ! -z $EC2_VOLUME_ID ];
+then
+	var_backup_region=$EC2_BACKUP_VOLUME_ZONE
+else
+	var_backup_region=$EC2_BACKUP_CURRENT_REGION
+fi
+
+#split the argument from EC2_BACKUP_FLAGS_AWS
+if [ ! -z "$EC2_BACKUP_FLAGS_AWS" ];
+then
+	log $V "EC2_BACKUP_FLAGS_AWS: $EC2_BACKUP_FLAGS_AWS"
+	confi_args=($EC2_BACKUP_FLAGS_AWS)
+	for ((index=0; index <= ${#confi_args[@]}; index++));
+	do
+		if [ "${confi_args[index]}" == "--security-groups" ]; 
+		then
+			var_security_group="${confi_args[index+1]}"
+			check_security_group $var_security_group
+		fi
+				
+		if [ "${confi_args[index]}" == "--key-name" ]; 
+		then
+			var_key_pair="${confi_args[index+1]}"
+			check_key_pair $var_key_pair
+		fi
+	done
+fi
+
+# # todo list
+# # create a ec2 instance security-group, key-pair
+
+# retrieve_back most suitable instance id by given volume id or your current region
+retrieve_image_id() {
+	local __return_value=$1
+	for instance_info in "${EC2_BACKUP_INSTANCES_DIC[@]}" ; do
+	    KEY=${instance_info%%:*}
+	    VALUE=${instance_info#*:}
+	    if [[ $var_backup_region == $KEY* ]];
+	    then
+	    	log $V "Back up Image id is [$VALUE] : locate in the Region [$KEY]" 
+	    	eval $__return_value=$VALUE
+	    	break
+		fi
+	done
+	if [ -z ${!__return_value} ];
+	then
+		log "YOUR REGION: $var_backup_region  IS UNSPPORT"
+		exit 1
+	fi
+}
+
+# create instance use var_instance_id, var_security_group, var_key_pair
+create_instance() {
+	retrieve_image_id var_image_id
+	log $V "Create Instance: aws ec2 run-instances --image-id $var_image_id --placement AvailabilityZone=$EC2_BACKUP_DEFAULT_ZONE  ${EC2_BACKUP_FLAGS_AWS}"
+	var_instance_id=$(aws ec2 run-instances --image-id $var_image_id --placement AvailabilityZone=$EC2_BACKUP_DEFAULT_ZONE  ${EC2_BACKUP_FLAGS_AWS}  --output text --query 'Instances[0].[InstanceId]')
+	
+	if [ $? -ne 0 ];
+	then 
+		log "An error happens to the Create Instance"
+		terminate_instance
+		exit 1
+	fi
+	
+	log $V  "The create Instance is $var_instance_id with image id $var_image_id "
+	log $V  "Running Instance $var_instance_id"
+	
+	visual_sleep check_create_instance "Instance $var_instance_id is running"  60
+
+	if [ $? -ne 0 ];
+	then 
+		log "An error happens to the Running Instance"
+		terminate_instance
+		exit 1
+	fi
+}
+
+get_host() {
+	var_instace_host=$(aws ec2 describe-instances --instance-id $var_instance_id --output text --query 'Reservations[0].[Instances[0].PublicDnsName]')
+	log $V "Get the host: $var_instace_host"
+}
+
+check_ssh_connection() {
+		ssh $EC2_BACKUP_FLAGS_SSH -o ConnectTimeout=1 -o BatchMode=yes -o StrictHostKeyChecking=no $var_instance_username@$var_instace_host 'exit' 1>&2 2>/dev/null 
+		if [ $? -ne 0 ];
+		then 
+			return 1
+		fi
+}
+
+generate_volume() {
+	du -shBM $BACKUP_DIR 1>/dev/null
+	if [ $? -ne 0 ];
+	then
+		log "You didn't have permission to backup folder $BACKUP_DIR"
+		exit 1	
+	fi
+	
+	local size=`du -shBM $BACKUP_DIR | cut -f1 | sed s/M//`
+	
+	local minum_size=0
+	local g_size
+	((minum_size=$size*2)) # at least 2 * size
+ 	((g_size=$minum_size/1024))
+	if [ -z $EC2_VOLUME_ID ]; # no specified volume, so we need create new one
+	then
+		if [ $g_size -eq 0 ]; # means the size is less than 1G
+		then
+			((g_size=1))
+		elif [ $g_size -gt 1024 ]; # means the size is more 1 TB
+		then
+			log "Can't afford to support more than 1TB volume"
+			exit 1
+		else
+			((g_size=$g_size+1))
+		fi
+	else # we need get volumesize and judge it's suitable go on the back up operation
+		log $V "aws ec2 describe-volumes --volume-id  $EC2_VOLUME_ID --output text --query 'Volumes[0].[Size]'"
+		local volume_size=$(aws ec2 describe-volumes --volume-id  $EC2_VOLUME_ID --output text --query 'Volumes[0].[Size]')
+		minum_size=$volume_size
+		((volume_size=$volume_size*1024))
+		log $V "The Volume: $volume_size , BackUp: $size"
+		if [ $size -ge $volume_size ];
+		then
+			log "The Volume: [$EC2_VOLUME_ID] you give doesn't have enough space to for backup"
+			exit 1
+		fi
+	fi
+	
+	if [ -z $EC2_VOLUME_ID ]; # create a new volume
+	then
+		var_volume_id=$(aws ec2 create-volume --availability-zone $EC2_BACKUP_DEFAULT_ZONE --region $EC2_BACKUP_CURRENT_REGION --size $g_size --output text --query 'VolumeId')			
+		visual_sleep check_volume_exist "Volume is running..." 30
+		if [ $? -ne 0 ];
+		then
+			log " Error Happens when create volume "
+			exit 1
+		fi	
+	fi
+	
+	var_volume_size=$minum_size
+	
+	log $V "Volume: [$var_volume_id] with the size: $g_size G"
+}
+
+attach_volume() {
+	log $V "aws ec2 attach-volume --volume-id $var_volume_id --instance-id $var_instance_id --device $var_default_attachpoint"
+	if [ -z $EC2_BACKUP_VERBOSE ];
+	then
+		aws ec2 attach-volume --volume-id $var_volume_id --instance-id $var_instance_id --device $var_default_attachpoint 2>&1 1>/dev/null
+	else
+		aws ec2 attach-volume --volume-id $var_volume_id --instance-id $var_instance_id --device $var_default_attachpoint
+	fi
+	
+	if [ $? -ne 0 ];
+	then
+		log "Can't Attach Volume; Failed to attach volume $var_volume_id"
+		terminate_instance
+		exit 1
+	fi
+		
+	visual_sleep check_attach_volume "Attaching the volume $var_volume_id to Instance $var_instance_id ...." 30
+	
+	if [ $? -ne 0 ];
+	then
+		log "Attaching the volume timeout; Failed to attach volume $var_volume_id"
+		terminate_instance
+		exit 1
+	fi
+		
+}
+
+detach_volume() {
+	log $V ">>> Detaching Volume"
+	#unmount volume
+	if [ "$EC2_BACKUP_METHOD" == "rsync" ];
+	then
+		local unmount_cmd="ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host 'sudo umount -d $var_default_devicename'"
+		log $V "Unmount Device $var_default_devicename"
+		log $V "$unmount_cmd"
+		eval $unmount_cmd
+	fi
+
+	log $V "aws ec2 detach-volume --volume-id $var_volume_id --instance-id $var_instance_id --device $var_default_attachpoint"
+	
+	if [ -z $EC2_BACKUP_VERBOSE ];
+	then
+		aws ec2 detach-volume --volume-id $var_volume_id --instance-id $var_instance_id --device $var_default_attachpoint 2>&1 1>/dev/null
+	else
+		aws ec2 detach-volume --volume-id $var_volume_id --instance-id $var_instance_id --device $var_default_attachpoint
+	fi
+	
+	if [ $? -ne 0 ];
+	then
+		log "Can't Detach Volume; Failed to Detach volume $var_volume_id"
+		terminate_instance
+		exit 1
+	fi
+	
+	visual_sleep check_detach_volume "Detaching the volume $var_volume_id to Instant $var_instance_id" 30
+	
+	if [ $? -ne 0 ];
+	then
+		log "Detach Volume timeout; Failed to Detach volume $var_volume_id"
+		terminate_instance
+		exit 1
+	fi
+}
+
+dd_backup() {
+	log $V ">>> DD BACKUP"
+	log $V "Use dd+tar to backup to Volume: $var_volume_id"
+	if [ -z $EC2_BACKUP_VERBOSE ];
+	then
+		local dd_cmd="tar -cf - $1 | ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host 'sudo dd of=$var_default_devicename' 1>/dev/null 2>/dev/null"
+	else 
+		local dd_cmd="tar -cf - $1 -v | ssh -v ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host 'sudo dd of=$var_default_devicename'"
+	fi
+
+	log $V "$dd_cmd"
+	eval $dd_cmd
+	
+	if [ $? -ne 0 ];
+	then
+		log "errors happens when try to use command dd"
+		terminate_all_resource
+		exit 1
+	fi	
+	
+}
+
+rsync_backup() {
+	log $V ">>> RYSNC BACKUP"
+	log $V "Use rsync to backup to Volume: $var_volume_id"	
+	local rsync_cmd="rsync -e \"ssh ${EC2_BACKUP_FLAGS_SSH}\" --rsync-path=\"sudo rsync\" -aRz --delete $1 $var_instance_username@$var_instace_host:$var_rsync_backup_dir"
+	if [ ! -z $EC2_BACKUP_VERBOSE ];
+	then
+		rsync_cmd="rsync -e \"ssh ${EC2_BACKUP_FLAGS_SSH}\" --rsync-path=\"sudo rsync\" -avRz --delete $1 $var_instance_username@$var_instace_host:$var_rsync_backup_dir"
+	fi
+
+	log $V "$rsync_cmd"
+	eval $rsync_cmd
+	
+	if [ $? -ne 0 ];
+	then
+		log "errors happens when try to use command rync"
+		terminate_all_resource
+		exit 1
+	fi	
+}
+
+# terminate instance
+terminate_instance() {
+	log $V ">>> Terminate Instance"
+	if [ ! -z $var_instance_id ];
+	then
+		var_terminate_code=$(aws ec2  terminate-instances --instance-ids $var_instance_id --output text  --query 'TerminatingInstances[0].[CurrentState[0].Code]')
+		
+		visual_sleep check_terminate_instance "Instance $var_instance_id is terminating" 60
+	fi
+	
+	log ">>> The Kept Volume ID is  $var_volume_id <<<"
+}
+
+# terminate instance and volume
+terminate_all_resource() {
+	log $V ">>> Now terminating all the resource"
+	detach_volume
+	terminate_instance
+}
+
+
+###############################################################
+## Core Procedure to backup
+###############################################################
+
+log $V ">>> CHECKING VOLUME SIZE....."
+generate_volume
+
+log $V ">>> CREATING INSTANCE...."
+create_instance
+get_host
+
+log $V ">>> Test SSH Connection...."
+log $V "ssh $EC2_BACKUP_FLAGS_SSH -o ConnectTimeout=1 -o BatchMode=yes -o StrictHostKeyChecking=no $var_instance_username@$var_instace_host"
+visual_sleep check_ssh_connection "SSH to the instance [$var_instance_id] testing "  30 
+
+if [ $? -ne 0 ];
+then
+	log "Can't build up the ssh connection, Please check EC2_BACKUP_FLAGS_AWS and EC2_BACKUP_FLAGS_SSH"
+	log "Current EC2_BACKUP_FLAGS_AWS: $EC2_BACKUP_FLAGS_AWS"
+	log "Current EC2_BACKUP_FLAGS_SSH: $EC2_BACKUP_FLAGS_SSH"
+	log "Make sure you have vaild key-name security-groups ec2-key in your current region [$EC2_BACKUP_CURRENT_REGION]"
+	log "You may configure them in the following flag"
+	log "eg. export EC2_BACKUP_FLAGS_SSH=\"-i ~/.ssh/ec2-key\""
+	log "eg. export EC2_BACKUP_FLAGS_AWS=\"--key-name KEY-NAME --security-groups SECURITY-GROUP\""
+	terminate_instance
+	exit 1
+fi
+log $V ">>>  Attaching Volume...."
+attach_volume
+
+###############################################################
+## Perform Back Up
+###############################################################	
+
+log $V ">>> Begin to BACKUP WITH METHOD $EC2_BACKUP_METHOD ON DIRECTORY $BACKUP_DIR"	
+
+if [ "$EC2_BACKUP_METHOD" == "dd" ];
+then
+	## no need to create file system
+	dd_backup $BACKUP_DIR
+else
+	##create file system
+	log $V "Make Mount Dir : $var_default_mountDir"
+	log $V "ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host sudo mkdir $var_default_mountDir 2>/dev/null"
+	ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host sudo mkdir $var_default_mountDir 2>/dev/null
+	sleep 2
+	
+	##check the file system of remote volume
+	var_current_file_sys=$(ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host sudo  file -s $var_default_devicename)
+	var_is_ext4="$(echo $var_current_file_sys | grep ext4)"
+	log $V "The $var_default_devicename format is: $var_current_file_sys"
+	
+	if test -z $var_is_ext4; # if it isn't ext4 we format
+	then
+		log $V "Format attach volume with (Only Support Ext4) : $var_default_devicename"
+		log $V "ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host sudo  mkfs -t ext4 $var_default_devicename 1>/dev/null 2>/dev/null"
+		ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host sudo  mkfs -t ext4 $var_default_devicename 1>/dev/null 2>/dev/null
+		sleep 2
+	else
+		log $V "The Volume is already EXT4!"
+	fi
+	
+	#mount the device on the mount point
+	log $V "Mount the device: $var_default_attachpoint on mount point: $var_default_mountDir"
+	log $V "ssh  ${EC2_BACKUP_FLAGS_SSH}  $var_instance_username@$var_instace_host  sudo mount $var_default_devicename $var_default_mountDir"
+	ssh  ${EC2_BACKUP_FLAGS_SSH}  $var_instance_username@$var_instace_host  sudo mount $var_default_devicename $var_default_mountDir 2>/dev/null
+	
+	sleep 2
+	
+	log $V "ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host test ! -e \"$var_rsync_backup_dir\""
+	if  ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host test ! -e "$var_rsync_backup_dir"; #if ryscn folder didn't exist
+	then
+		log $V "Make RSYNC BACKUP Dir : $var_rsync_backup_dir"
+		ssh ${EC2_BACKUP_FLAGS_SSH} $var_instance_username@$var_instace_host sudo mkdir -p $var_rsync_backup_dir 2>/dev/null
+	else 
+		log $V "Already exist $var_rsync_backup_dir in Volume: [$var_volume_id]"
+	fi
+	
+	
+	if [ $? -ne 0 ];
+	then
+		log "Failed to backup directory $BACKUP_DIR with method $EC2_BACKUP_METHOD"
+		terminate_all_resource
+		exit 1
+	fi	
+	
+	rsync_backup $BACKUP_DIR
+	
+fi
+
+terminate_all_resource
+exit 0

@@ -1,0 +1,268 @@
+#!/bin/bash
+######################################################################## 
+#	The ec2-backup program is used to generate a comfortable way to work with 
+#	ec2-instance.
+#	Code implementation: 
+#    
+#	1) correct input if any invalid input will cause error
+#   	2) caculate the size of backup directory
+#   	3) backup
+#   	4) if success, any feedback
+######################################################################## 
+#export EC2_BACKUP_FLAGS_AWS="--key-name cs615_east_1_key_pair --security-groups cs615_us_east_1_group --instance-type t1.micro"
+#export EC2_BACKUP_VERBOSE=true
+#
+# CONSTANTS -- String CONSTANTS
+#
+V="VERBOSE"
+I="INFO"
+
+#
+# CONSTANTS -- CommandConstants
+#
+EC2_CHECK_VOLUME_ID="aws ec2 describe-volumes --volume-ids"
+EC2_BACKUP_VERBOSE=`env | grep EC2_BACKUP_VERBOSE`
+EC2_BACKUP_FLAGS_SSH=`env | grep EC2_BACKUP_FLAGS_SSH` | sed 's/EC2_BACKUP_FLAGS_SSH=//'
+EC2_BACKUP_FLAGS_AWS=`env | grep EC2_BACKUP_FLAGS_AWS` | sed 's/EC2_BACKUP_FLAGS_AWS=//'
+EC2_BACKUP_CURRENT_REGION=$(aws ec2 describe-availability-zones --output text --query 'AvailabilityZones[0].[RegionName]')
+EC2_BACKUP_DEFAULT_ZONE=$(aws ec2 describe-availability-zones --output text --query 'AvailabilityZones[0].[ZoneName]')
+
+export EC2_BACKUP_VERBOSE
+export EC2_BACKUP_FLAGS_SSH
+export EC2_BACKUP_FLAGS_AWS
+export EC2_BACKUP_CURRENT_REGION
+export EC2_BACKUP_DEFAULT_ZONE
+export V
+export I
+
+#
+# Utils --- log
+#
+
+#type, message
+log() {
+	if [ $# -eq 1 ];
+	then
+		info_log "$1" $2 $3 $4;
+		return 0
+	fi
+	
+	if [[ "$1" == "$I" ]];
+	then
+		info_log "$2"  $3 $4 $5;
+	fi
+	
+	if [[ "$1" == "$V" ]];
+	then
+		if [[ ! -z "$EC2_BACKUP_VERBOSE" ]];
+		then
+			debug_log "$2" $3 $4 $5;
+		fi
+	fi
+}
+
+info_log() {
+	echo "[INFO]	${1}" $2 $3 $4 ;
+}
+
+debug_log() {
+	echo "[VEBO]	${1}"  $2 $3 $4;
+}
+
+#copy for the basic shell: source: https://www.cs.stevens.edu/~jschauma/615A/examples/shexamples
+#$1 function to getresult
+#$2 info message
+#$3 max time
+visual_sleep() {
+	local max=$3
+	local n
+	local func=$1
+	local status=1
+	log  $V "$2"
+	n=0
+	while [ $n -lt ${max} ]; do
+ 		
+ 		if [ ! -z $EC2_BACKUP_VERBOSE ];
+ 		then
+ 			printf .		
+ 		fi
+ 		
+		n=$(( n + 1 ))
+		$func
+		if [ $? -eq 0 ];
+		then
+			status=0
+			break
+		fi
+		sleep 1
+	done
+	if [ ! -z $EC2_BACKUP_VERBOSE ];
+ 	then
+ 		printf "\n"
+	fi
+ 	
+	if [ $status -eq 0 ];
+	then
+		log $V "done!"		
+	else 
+		return 1
+	fi
+}
+
+export -f log > /dev/null
+export -f info_log > /dev/null
+export -f debug_log > /dev/null
+export -f visual_sleep > /dev/null
+
+usage() {
+	log "Usage: ec2-backup [-h] [-m method] [-v volume-id] dir"	
+	log "Using EC2_BACKUP_FLAGS_AWS to configure your own AWS Instance Creation"
+	log "eg. export EC2_BACKUP_FLAGS_AWS=\"--key-name KEY-NAME --security-groups SECURITY-GROUP\""
+	log "Using EC2_BACKUP_FLAGS_SSH to create a custom SSH connection"
+	log "eg. export EC2_BACKUP_FLAGS_SSH=\"-i ~/.ssh/ec2-key\""
+	log "Using EC2_BACKUP_VERBOSE to see more details!"
+	log "eg. export EC2_BACKUP_VERBOSE=true"
+}
+
+
+#
+# Utils --- check
+#
+
+check_method() {
+	log $V "Checking methond [$1] ...."
+	if [ "$1" == "dd" ] || [ "$1" == "rsync" ];
+	then
+	log ${V} "The method is [$1]"
+	else
+		log "unrecognized method [$1]; method should be \"dd\" or \"rsync\" "
+		usage	
+		exit 1
+	fi	
+}
+
+check_volume_id() {
+	eval "$EC2_CHECK_VOLUME_ID $1 2>/dev/null 1>/dev/null" && log ${V} "The volume id $1 check is successful" 
+	if [ $? -ne 0 ];
+	then
+		log "The volume id [$1] does not exist in your current region [$EC2_BACKUP_CURRENT_REGION]: please check your volume"
+		usage
+		exit 1
+	fi	
+}
+
+check_directory() {
+	if [ ! -e $1 ];
+	then
+		log "BackUp Directory [$1] is not exist; please give a valid backup directory!"
+		usage
+		exit 1
+	elif [ -z $1 ]
+	then
+		log "BackUp Directory is Mandatory; please give a valid backup directory!"
+		usage
+		exit 1
+	fi	
+}
+
+split_paramters() {
+	for arg in $@; do
+		if [[ $arg == vol-* ]] && [ -z $EC2_VOLUME_ID ];
+		then 
+			EC2_VOLUME_ID=$arg
+			check_volume_id $EC2_VOLUME_ID
+		else	
+			BACKUP_DIR=$arg
+			check_directory $BACKUP_DIR
+		fi
+	done
+}
+
+#
+# Input Parameter Optimize --- 
+#
+
+# ec2-backup [-h] [-m method] [-v volume-id] dir
+# dir is mandatory
+# eg. ec2-backup -m rsync  vol-a1b2c3d4 .
+# eg. ec2-backup . vol-a1b2c3d4
+
+EC2_VOLUME_ID=''
+EC2_BACKUP_METHOD='dd'
+BACKUP_DIR=''
+
+export EC2_VOLUME_ID
+export EC2_BACKUP_METHOD
+export BACKUP_DIR
+
+if [ $# -eq 0 ];
+then
+	usage
+	exit 1
+fi
+log $V "Obtain Command Args"
+
+while getopts ':m:v:h' opt; do
+	case ${opt} in
+		h)
+			usage
+			exit 0
+		;;
+		m)
+			EC2_BACKUP_METHOD=${OPTARG}
+			check_method $EC2_BACKUP_METHOD
+		;;
+		v)
+			EC2_VOLUME_ID=${OPTARG}
+			check_volume_id $EC2_VOLUME_ID
+		;;
+		:)
+			log "Option -$OPTARG requires an argument."
+			usage
+			exit 1
+		;;
+		*)
+			if [ \( $# -lt 2 \) -o \( $# -gt 5 \) ];
+			then
+				usage
+				exit 1
+			fi
+			
+			exit 1
+		;;
+	esac
+done
+shift $(( ${OPTIND} - 1 ))
+
+
+split_paramters $@
+
+##### volume Id 
+# if [ -z $EC2_VOLUME_ID ];
+# then
+# 	log "Volume Id is mandatory; please give a valid volume Id!"
+# 	usage
+# 	exit 1
+# fi
+
+check_directory $BACKUP_DIR
+check_method $EC2_BACKUP_METHOD
+# check_volume_id $EC2_VOLUME_ID
+
+if [ ! -e "./create-instance-volume" ];
+then
+	log "Make sure create-instance-volume is in the same folder"
+	exit 1
+fi
+
+if [ ! -x "./create-instance-volume" ];
+then
+	chmod +x ./create-instance-volume
+	if [ $? -ne 0 ]
+	then
+		log "Change create-instance-volume to executable failed!"
+		exit 1
+	fi
+fi
+
+./create-instance-volume $EC2_VOLUME_ID
